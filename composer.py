@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 
 import gemini_client
@@ -512,19 +513,29 @@ def fallback_compose(category: dict, merchant: dict, trigger: dict, customer: di
     }
 
 
+_last_provider_debug: str = "n/a"
+
+
 async def _llm_complete(system: str, user: str, *, client, estimated_prompt_tokens: int, allow_wait: bool) -> str:
     """Try Gemini first (if GEMINI_API_KEY is configured), bounded by a timeout that
     still leaves room to fall through to the proven Groq pool within budget. ANY
     Gemini failure (timeout, dropped connection, empty content) is logged and
     swallowed here -- it never affects overall reliability, since Groq is the
     already-verified fallback either way. Gemini is pure upside when it works."""
+    global _last_provider_debug
     if gemini_client.enabled():
         gemini_timeout = 25.0 if allow_wait else 11.0
         try:
-            return await gemini_client.complete(system, user, max_tokens=1200, timeout=gemini_timeout)
+            text = await gemini_client.complete(system, user, max_tokens=1200, timeout=gemini_timeout)
+            _last_provider_debug = "gemini:ok"
+            return text
         except gemini_client.GeminiError as e:
             logger.info("Gemini unavailable this call, falling back to Groq pool: %s", e)
-    return await _complete_with_optional_wait(system, user, client=client, estimated_prompt_tokens=estimated_prompt_tokens, allow_wait=allow_wait)
+            _last_provider_debug = f"gemini:FAILED({e})"
+    text = await _complete_with_optional_wait(system, user, client=client, estimated_prompt_tokens=estimated_prompt_tokens, allow_wait=allow_wait)
+    if not _last_provider_debug.startswith("gemini:ok"):
+        _last_provider_debug += " -> groq:ok"
+    return text
 
 
 async def _complete_with_optional_wait(system: str, user: str, *, client, estimated_prompt_tokens: int, allow_wait: bool) -> str:
@@ -630,6 +641,8 @@ async def compose_message(
 
         result["send_as"] = send_as
         result["suppression_key"] = suppression_key
+        if os.environ.get("VERA_DEBUG_PROVIDER"):
+            result["rationale"] = f"[{_last_provider_debug}] {result['rationale']}"
         return result
     except groq_client.GroqError as e:
         logger.warning("LLM composition failed, using fallback: %s", e)
