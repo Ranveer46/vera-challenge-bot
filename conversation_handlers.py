@@ -17,6 +17,7 @@ import json
 import logging
 import re
 
+import gemini_client
 import groq_client
 from store import ConversationState
 
@@ -231,14 +232,21 @@ async def compose_reply(
         f"Already sent, do not repeat: {conv.sent_bodies[-2:]}"
     )
 
-    if not groq_client.api_key():
+    if not groq_client.api_key() and not gemini_client.enabled():
         body = f"Got it, {name} -- noted. What would you like me to do next?"
         return {"action": "send", "body": body, "cta": "open_ended",
                 "rationale": "Fallback (no LLM configured): generic acknowledgment + open next-step ask."}
 
     try:
         est_tokens = (len(system) + len(user)) // 4
-        raw = await groq_client.complete(system, user, client=client, estimated_prompt_tokens=est_tokens)
+        raw = None
+        if gemini_client.enabled():
+            try:
+                raw = await gemini_client.complete(system, user, max_tokens=800, timeout=11.0)
+            except gemini_client.GeminiError as e:
+                logger.info("Gemini unavailable this reply, falling back to Groq pool: %s", e)
+        if raw is None:
+            raw = await groq_client.complete(system, user, client=client, estimated_prompt_tokens=est_tokens)
         parsed = groq_client.extract_json(raw) or {}
         body = (parsed.get("body") or "").strip()
         cta = parsed.get("cta") if parsed.get("cta") in {

@@ -8,6 +8,8 @@ services:
     envVars:
       - key: GROQ_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
       - key: TEAM_NAME
         value: Solo Builder
       - key: CONTACT_EMAIL
