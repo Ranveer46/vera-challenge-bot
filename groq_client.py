@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import logging
@@ -39,8 +40,6 @@ def _load_dotenv_if_present() -> None:
 _load_dotenv_if_present()
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 
 
 class GroqError(Exception):
@@ -77,6 +76,10 @@ REASONING_MODELS_PREFIX = ("openai/gpt-oss",)
 # Arabic responses even for English/Hindi-English prompts), and
 # openai/gpt-oss-safeguard-20b (a moderation-tuned variant, not validated for
 # this use case).
+#
+# GROQ_MODEL_POOL (comma-separated) is the one config knob that controls both
+# the pool AND the primary/display model (DEFAULT_MODEL = pool[0]) -- there is
+# no separate GROQ_MODEL override to keep out of sync with it.
 DEFAULT_MODEL_POOL = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
@@ -85,6 +88,7 @@ DEFAULT_MODEL_POOL = [
 ]
 _POOL_ENV = os.environ.get("GROQ_MODEL_POOL")
 _MODEL_POOL = [m.strip() for m in _POOL_ENV.split(",") if m.strip()] if _POOL_ENV else DEFAULT_MODEL_POOL
+DEFAULT_MODEL = _MODEL_POOL[0]
 
 MODEL_TPM_LIMITS: dict[str, int] = {
     "openai/gpt-oss-120b": 8000,
@@ -120,16 +124,39 @@ def _has_headroom(model: str, estimated_tokens: int) -> bool:
     return _estimated_recent_usage(model) + estimated_tokens <= _model_tpm_limit(model)
 
 
-def pick_model(estimated_tokens: int = 2500, exclude: str | None = None) -> str | None:
-    """Walk the pool in preference order, returning the first model with estimated
-    headroom under ITS OWN per-minute token budget. Returns None if every pooled
-    model is near its limit (caller should fall back to the deterministic template)."""
-    for candidate in _MODEL_POOL:
-        if candidate == exclude:
-            continue
-        if _has_headroom(candidate, estimated_tokens):
-            return candidate
-    return None
+async def _post_once(client: httpx.AsyncClient, headers: dict, chosen_model: str,
+                      system: str, user: str, temperature: float, max_tokens: int,
+                      reasoning_effort: str) -> tuple[str | None, str | None]:
+    """Fire one real HTTP call. Returns (content, None) on success or (None, error_message)."""
+    payload = {
+        "model": chosen_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if chosen_model.startswith(REASONING_MODELS_PREFIX):
+        payload["reasoning_effort"] = reasoning_effort
+    try:
+        resp = await client.post(GROQ_URL, json=payload, headers=headers)
+        if resp.status_code in (429, 400):
+            return None, f"http {resp.status_code} on {chosen_model}: {resp.text[:200]}"
+        resp.raise_for_status()
+        data = resp.json()
+        message = data["choices"][0]["message"]
+        content = message.get("content") or ""
+        finish_reason = data["choices"][0].get("finish_reason")
+        if not content.strip() and finish_reason == "length":
+            return None, f"truncated (finish_reason=length) on {chosen_model}"
+        return content, None
+    except httpx.TimeoutException as e:
+        return None, f"timeout on {chosen_model}: {e}"
+    except httpx.HTTPStatusError as e:
+        return None, f"http {e.response.status_code} on {chosen_model}: {e.response.text[:200]}"
+    except Exception as e:  # noqa: BLE001
+        return None, f"{chosen_model}: {e}"
 
 
 async def complete(
@@ -148,75 +175,64 @@ async def complete(
 
     Note: openai/gpt-oss-* models on Groq are reasoning models that spend part
     of `max_tokens` on a hidden chain-of-thought before the actual answer. We
-    pin reasoning_effort="low" to keep that bounded. If no pooled model has
-    estimated headroom under its own per-minute token cap, raises GroqError
-    immediately so the caller can use its deterministic fallback rather than
-    waiting out a guaranteed 429.
+    pin reasoning_effort="low" to keep that bounded.
+
+    When `model` is None (the normal path), this walks the pool: for each
+    candidate, it RESERVES the estimated token cost immediately (before firing
+    the request), not after the response returns -- otherwise several
+    concurrent calls in the same tick (composing multiple triggers at once)
+    would all see "headroom" on the same model and race onto it, blowing past
+    its real per-request burst capacity even though the minute-level budget
+    looked fine. If every pooled model looks exhausted by our own estimate, we
+    take one short real backoff (Groq's server-side burst bucket often
+    recovers within a couple seconds even when our rolling-window estimate
+    hasn't) and retry the primary model directly. Only after that raises
+    GroqError, so the caller can fall back to the deterministic template
+    rather than waiting out a guaranteed failure.
     """
     key = api_key()
     if not key:
         raise GroqError("GROQ_API_KEY not set")
 
-    if model is None:
-        chosen_model = pick_model(estimated_prompt_tokens + max_tokens)
-        if chosen_model is None:
-            raise GroqError("all pooled models near TPM limit; skipping call to avoid a guaranteed 429")
-    else:
-        chosen_model = model
-
-    payload = {
-        "model": chosen_model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if chosen_model.startswith(REASONING_MODELS_PREFIX):
-        payload["reasoning_effort"] = reasoning_effort
-
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    total_estimate = estimated_prompt_tokens + max_tokens
 
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(timeout=timeout)
     try:
-        resp = await client.post(GROQ_URL, json=payload, headers=headers)
-        if resp.status_code == 429 and model is None:
-            # retry against the next pooled model with headroom, not just one fixed "other"
-            other = pick_model(estimated_prompt_tokens + max_tokens, exclude=chosen_model)
-            if other:
-                payload["model"] = other
-                payload.pop("reasoning_effort", None)
-                if other.startswith(REASONING_MODELS_PREFIX):
-                    payload["reasoning_effort"] = reasoning_effort
-                chosen_model = other
-                resp = await client.post(GROQ_URL, json=payload, headers=headers)
-        if resp.status_code == 400 and model is None:
-            payload["model"] = FALLBACK_MODEL
-            if FALLBACK_MODEL.startswith(REASONING_MODELS_PREFIX):
-                payload["reasoning_effort"] = reasoning_effort
-            chosen_model = FALLBACK_MODEL
-            resp = await client.post(GROQ_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        usage = data.get("usage", {})
-        _record_usage(chosen_model, usage.get("total_tokens", estimated_prompt_tokens + max_tokens))
-        message = data["choices"][0]["message"]
-        content = message.get("content") or ""
-        finish_reason = data["choices"][0].get("finish_reason")
-        if not content.strip() and finish_reason == "length":
-            raise GroqError("truncated before content was emitted (finish_reason=length); increase max_tokens")
-        return content
-    except httpx.TimeoutException as e:
-        raise GroqError(f"timeout: {e}") from e
-    except httpx.HTTPStatusError as e:
-        raise GroqError(f"http {e.response.status_code}: {e.response.text[:300]}") from e
-    except GroqError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise GroqError(str(e)) from e
+        if model is not None:
+            content, err = await _post_once(client, headers, model, system, user, temperature, max_tokens, reasoning_effort)
+            if content is not None:
+                _record_usage(model, total_estimate)
+                return content
+            raise GroqError(err or "unknown error")
+
+        tried: set[str] = set()
+        last_error: str | None = None
+
+        for candidate in _MODEL_POOL:
+            if not _has_headroom(candidate, total_estimate):
+                continue
+            _record_usage(candidate, total_estimate)  # reserve BEFORE firing
+            tried.add(candidate)
+            content, err = await _post_once(client, headers, candidate, system, user, temperature, max_tokens, reasoning_effort)
+            if content is not None:
+                return content
+            last_error = err
+
+        # every pooled model looked exhausted by our own estimate (or failed) --
+        # one short real backoff, then retry the primary model directly
+        if _MODEL_POOL:
+            await asyncio.sleep(1.5)
+            primary = _MODEL_POOL[0]
+            _record_usage(primary, total_estimate)
+            content, err = await _post_once(client, headers, primary, system, user, temperature, max_tokens, reasoning_effort)
+            if content is not None:
+                return content
+            last_error = err
+
+        raise GroqError(last_error or "no pooled models configured")
     finally:
         if owns_client:
             await client.aclose()

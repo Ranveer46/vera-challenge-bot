@@ -9,7 +9,8 @@ Env:
     GROQ_API_KEY        required for real LLM composition (falls back to
                         deterministic templates if unset, so the bot still
                         runs and responds correctly-shaped JSON without it)
-    GROQ_MODEL          optional, default "openai/gpt-oss-120b"
+    GROQ_MODEL_POOL     optional, comma-separated model list; default is a validated
+                        4-model pool (see groq_client.py)
     TEAM_NAME, TEAM_MEMBERS, CONTACT_EMAIL, BOT_VERSION  optional, for /v1/metadata
 """
 
