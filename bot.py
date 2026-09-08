@@ -11,10 +11,6 @@ Env:
                         runs and responds correctly-shaped JSON without it)
     GROQ_MODEL_POOL     optional, comma-separated model list; default is a validated
                         4-model pool (see groq_client.py)
-    GEMINI_API_KEY      optional; when set, Gemini is tried FIRST for every
-                        composition (bounded timeout), falling through to the
-                        Groq pool on any failure -- pure upside, zero added risk
-    GEMINI_MODEL        optional, default "gemini-flash-latest"
     TEAM_NAME, TEAM_MEMBERS, CONTACT_EMAIL, BOT_VERSION  optional, for /v1/metadata
 """
 
@@ -35,7 +31,6 @@ from typing import Any, Optional
 
 import composer
 import conversation_handlers as ch
-import gemini_client
 import groq_client
 from store import STORE, now_iso
 
@@ -83,21 +78,15 @@ async def metadata():
     return {
         "team_name": os.environ.get("TEAM_NAME", "Solo Builder"),
         "team_members": os.environ.get("TEAM_MEMBERS", "Nikhil").split(","),
-        "model": (
-            f"{gemini_client.DEFAULT_MODEL} (primary) -> groq/{groq_client.DEFAULT_MODEL} "
-            f"(+ {len(groq_client._MODEL_POOL) - 1} pooled overflow models)"
-            if gemini_client.enabled()
-            else f"groq/{groq_client.DEFAULT_MODEL} (+ {len(groq_client._MODEL_POOL) - 1} pooled overflow models)"
-        ),
+        "model": f"groq/{groq_client.DEFAULT_MODEL} (+ {len(groq_client._MODEL_POOL) - 1} pooled overflow models)",
         "approach": (
             "4-context composer (category/merchant/trigger/customer) dispatched by trigger.kind to a "
-            "kind-specific framing prompt, temperature=0, post-LLM validation (URL strip, CTA-shape check, "
-            "taboo-vocab strip, anti-repetition/specificity retry) with a deterministic template fallback if "
-            "no LLM tier succeeds. When configured, Gemini is tried first under a bounded timeout, falling "
-            "through to a preference-ordered pool of independently-hosted Groq models with reserved (not "
-            "after-the-fact) per-minute token budgets -- sustained or concurrent load degrades gracefully "
-            "through several real-LLM tiers before ever reaching the template fallback. Reply handling uses "
-            "fast regex/streak heuristics for "
+            "kind-specific framing prompt, Groq LLM at temperature=0, post-LLM validation (URL strip, "
+            "CTA-shape check, taboo-vocab strip, anti-repetition retry) with a deterministic template "
+            "fallback if the LLM is unavailable or times out. Composition draws from a preference-ordered "
+            "pool of independently-hosted Groq models with reserved (not after-the-fact) per-minute token "
+            "budgets, so sustained or concurrent load degrades gracefully through several real-LLM tiers "
+            "before ever reaching the template fallback. Reply handling uses fast regex/streak heuristics for "
             "auto-reply detection, intent-transition routing, and hostile/off-topic exits before falling "
             "through to an LLM-composed continuation."
         ),

@@ -18,10 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 
-import gemini_client
 import groq_client
 
 logger = logging.getLogger("vera.composer")
@@ -513,31 +511,6 @@ def fallback_compose(category: dict, merchant: dict, trigger: dict, customer: di
     }
 
 
-_last_provider_debug: str = "n/a"
-
-
-async def _llm_complete(system: str, user: str, *, client, estimated_prompt_tokens: int, allow_wait: bool) -> str:
-    """Try Gemini first (if GEMINI_API_KEY is configured), bounded by a timeout that
-    still leaves room to fall through to the proven Groq pool within budget. ANY
-    Gemini failure (timeout, dropped connection, empty content) is logged and
-    swallowed here -- it never affects overall reliability, since Groq is the
-    already-verified fallback either way. Gemini is pure upside when it works."""
-    global _last_provider_debug
-    if gemini_client.enabled():
-        gemini_timeout = 25.0 if allow_wait else 11.0
-        try:
-            text = await gemini_client.complete(system, user, max_tokens=1200, timeout=gemini_timeout)
-            _last_provider_debug = "gemini:ok"
-            return text
-        except gemini_client.GeminiError as e:
-            logger.info("Gemini unavailable this call, falling back to Groq pool: %s", e)
-            _last_provider_debug = f"gemini:FAILED({e})"
-    text = await _complete_with_optional_wait(system, user, client=client, estimated_prompt_tokens=estimated_prompt_tokens, allow_wait=allow_wait)
-    if not _last_provider_debug.startswith("gemini:ok"):
-        _last_provider_debug += " -> groq:ok"
-    return text
-
-
 async def _complete_with_optional_wait(system: str, user: str, *, client, estimated_prompt_tokens: int, allow_wait: bool) -> str:
     """Live bot path (allow_wait=False): fail fast to the deterministic fallback within the
     30s call budget. Offline submission-generator path (allow_wait=True): this script has no
@@ -605,7 +578,7 @@ async def compose_message(
     system, user = build_prompt(category, merchant, trigger, customer)
     est_tokens = (len(system) + len(user)) // 4
     try:
-        raw = await _llm_complete(
+        raw = await _complete_with_optional_wait(
             system, user, client=client, estimated_prompt_tokens=est_tokens, allow_wait=allow_wait_on_rate_limit
         )
         parsed = groq_client.extract_json(raw) or {}
@@ -629,8 +602,8 @@ async def compose_message(
             )
 
         if needs_retry:
-            raw2 = await _llm_complete(
-                system, user + nudge, client=client, estimated_prompt_tokens=est_tokens, allow_wait=allow_wait_on_rate_limit
+            raw2 = await groq_client.complete(
+                system, user + nudge, client=client, temperature=0.4, estimated_prompt_tokens=est_tokens
             )
             parsed2 = groq_client.extract_json(raw2)
             if parsed2:
@@ -641,8 +614,6 @@ async def compose_message(
 
         result["send_as"] = send_as
         result["suppression_key"] = suppression_key
-        if os.environ.get("VERA_DEBUG_PROVIDER"):
-            result["rationale"] = f"[{_last_provider_debug}] {result['rationale']}"
         return result
     except groq_client.GroqError as e:
         logger.warning("LLM composition failed, using fallback: %s", e)
