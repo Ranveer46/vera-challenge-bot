@@ -1,0 +1,26 @@
+name: Keep Render service warm
+
+# Render's free tier spins the service down after 15 minutes of inactivity,
+# and the next request pays a cold-start delay (up to ~60s) before it responds
+# normally. The judge harness's own warmup phase (15 min before scoring) and
+# 5-minute tick cadence during the scored window both keep it warm on their
+# own -- this workflow only covers the gap between submitting the URL and
+# whenever the judge actually starts, which is otherwise unbounded.
+#
+# Pings /v1/healthz every 10 minutes, comfortably under the 15-minute
+# spin-down threshold. Safe to disable (Actions tab -> disable workflow)
+# once judging is confirmed complete.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping healthz
+        run: |
+          curl -sf -m 20 https://vera-challenge-bot-839k.onrender.com/v1/healthz \
+            || echo "healthz ping failed (non-fatal, just means the next real request may pay a cold start)"
