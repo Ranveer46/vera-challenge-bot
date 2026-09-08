@@ -77,14 +77,17 @@ async def metadata():
     return {
         "team_name": os.environ.get("TEAM_NAME", "Solo Builder"),
         "team_members": os.environ.get("TEAM_MEMBERS", "Nikhil").split(","),
-        "model": f"groq/{groq_client.DEFAULT_MODEL}",
+        "model": f"groq/{groq_client.DEFAULT_MODEL} (+ {len(groq_client._MODEL_POOL) - 1} pooled overflow models)",
         "approach": (
             "4-context composer (category/merchant/trigger/customer) dispatched by trigger.kind to a "
             "kind-specific framing prompt, Groq LLM at temperature=0, post-LLM validation (URL strip, "
             "CTA-shape check, taboo-vocab strip, anti-repetition retry) with a deterministic template "
-            "fallback if the LLM is unavailable or times out. Reply handling uses fast regex/streak "
-            "heuristics for auto-reply detection, intent-transition routing, and hostile/off-topic exits "
-            "before falling through to an LLM-composed continuation."
+            "fallback if the LLM is unavailable or times out. Composition draws from a preference-ordered "
+            "pool of Groq models with independent per-minute token budgets (a large-capacity model included "
+            "as overflow), so sustained load degrades gracefully through several real-LLM tiers before "
+            "ever reaching the template fallback. Reply handling uses fast regex/streak heuristics for "
+            "auto-reply detection, intent-transition routing, and hostile/off-topic exits before falling "
+            "through to an LLM-composed continuation."
         ),
         "contact_email": os.environ.get("CONTACT_EMAIL", "nikhil19092005@gmail.com"),
         "version": os.environ.get("BOT_VERSION", "1.0.0"),

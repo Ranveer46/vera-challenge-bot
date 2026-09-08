@@ -53,15 +53,53 @@ def api_key() -> str | None:
 
 REASONING_MODELS_PREFIX = ("openai/gpt-oss",)
 
-# Free-tier Groq keys have a per-model tokens-per-minute cap (observed: 8000 TPM
-# for both openai/gpt-oss-120b and openai/gpt-oss-20b). Each is capped
-# independently, so round-robining between two known-good models roughly
-# doubles effective throughput under load. A small client-side tracker below
-# avoids firing calls we already know will 429, converting straight to the
-# deterministic fallback instead of wasting a round trip against the budget.
-_MODEL_POOL = [DEFAULT_MODEL, FALLBACK_MODEL]
+# Free-tier Groq keys have a per-model tokens-per-minute cap, and it is NOT the
+# same for every model (observed on this account: 8000 TPM for the two
+# openai/gpt-oss-* models and for qwen/qwen3.8-27b, but 70000 TPM for
+# groq/compound-mini). Each model's budget is independent, so pooling several
+# gives a much larger combined ceiling than any single model alone.
+#
+# Pool order is a deliberate quality/determinism preference, not round-robin:
+# 1. openai/gpt-oss-120b -- primary. Best-understood, plain chat model (no
+#    autonomous tool use), extensively validated in this codebase.
+# 2. qwen/qwen3.8-27b -- confirmed equally reliable on our hardest instruction-
+#    following case (off-topic decline+redirect) and produces clean JSON with
+#    no reasoning leakage into content.
+# 3. groq/compound-mini -- large overflow capacity (70000 TPM). Also validated
+#    on both the real composer prompt and the off-topic case, but it's an
+#    agentic model that CAN invoke tools autonomously, which is a small
+#    determinism/latency risk we'd rather not take as the default path.
+# 4. openai/gpt-oss-20b -- last-resort overflow before the deterministic
+#    template; demonstrated weaker multi-step instruction-following earlier.
+#
+# Explicitly excluded after testing: qwen/qwen3.6-27b (leaks <think>...</think>
+# into the content field, breaking JSON parsing), allam-2-7b (defaults to
+# Arabic responses even for English/Hindi-English prompts), and
+# openai/gpt-oss-safeguard-20b (a moderation-tuned variant, not validated for
+# this use case).
+DEFAULT_MODEL_POOL = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "groq/compound-mini",
+    "openai/gpt-oss-20b",
+]
+_POOL_ENV = os.environ.get("GROQ_MODEL_POOL")
+_MODEL_POOL = [m.strip() for m in _POOL_ENV.split(",") if m.strip()] if _POOL_ENV else DEFAULT_MODEL_POOL
+
+MODEL_TPM_LIMITS: dict[str, int] = {
+    "openai/gpt-oss-120b": 8000,
+    "openai/gpt-oss-20b": 8000,
+    "qwen/qwen3.8-27b": 8000,
+    "groq/compound-mini": 70000,
+}
+DEFAULT_TPM_LIMIT = 8000
+TPM_SAFETY_FRACTION = 0.9  # stay under this fraction of each model's own cap
+
 _usage_window: dict[str, list[tuple[float, int]]] = {m: [] for m in _MODEL_POOL}
-TPM_SAFETY_LIMIT = 7200  # stay under the observed 8000 cap
+
+
+def _model_tpm_limit(model: str) -> int:
+    return int(MODEL_TPM_LIMITS.get(model, DEFAULT_TPM_LIMIT) * TPM_SAFETY_FRACTION)
 
 
 def _record_usage(model: str, tokens: int) -> None:
@@ -78,15 +116,18 @@ def _estimated_recent_usage(model: str) -> int:
     return sum(n for t, n in _usage_window.get(model, []) if t >= cutoff)
 
 
-def pick_model(estimated_tokens: int = 2500) -> str | None:
-    """Prefer the primary (higher-quality) model; only spill over to the secondary
-    when the primary is genuinely near its per-minute token budget. Blind round-robin
-    was rejected here: the secondary model follows multi-step behavioral instructions
-    (e.g. off-topic redirects) noticeably less reliably, so it should be overflow
-    capacity, not an equal partner. Returns None if both are near their limit
-    (caller should fall back to the deterministic template)."""
+def _has_headroom(model: str, estimated_tokens: int) -> bool:
+    return _estimated_recent_usage(model) + estimated_tokens <= _model_tpm_limit(model)
+
+
+def pick_model(estimated_tokens: int = 2500, exclude: str | None = None) -> str | None:
+    """Walk the pool in preference order, returning the first model with estimated
+    headroom under ITS OWN per-minute token budget. Returns None if every pooled
+    model is near its limit (caller should fall back to the deterministic template)."""
     for candidate in _MODEL_POOL:
-        if _estimated_recent_usage(candidate) + estimated_tokens <= TPM_SAFETY_LIMIT:
+        if candidate == exclude:
+            continue
+        if _has_headroom(candidate, estimated_tokens):
             return candidate
     return None
 
@@ -107,8 +148,8 @@ async def complete(
 
     Note: openai/gpt-oss-* models on Groq are reasoning models that spend part
     of `max_tokens` on a hidden chain-of-thought before the actual answer. We
-    pin reasoning_effort="low" to keep that bounded. If neither pooled model
-    has estimated headroom under the per-minute token cap, raises GroqError
+    pin reasoning_effort="low" to keep that bounded. If no pooled model has
+    estimated headroom under its own per-minute token cap, raises GroqError
     immediately so the caller can use its deterministic fallback rather than
     waiting out a guaranteed 429.
     """
@@ -142,11 +183,12 @@ async def complete(
         client = httpx.AsyncClient(timeout=timeout)
     try:
         resp = await client.post(GROQ_URL, json=payload, headers=headers)
-        if resp.status_code == 429:
-            # one retry against the OTHER pooled model, if it has headroom
-            other = next((m for m in _MODEL_POOL if m != chosen_model), None)
-            if other and model is None and _estimated_recent_usage(other) + estimated_prompt_tokens + max_tokens <= TPM_SAFETY_LIMIT:
+        if resp.status_code == 429 and model is None:
+            # retry against the next pooled model with headroom, not just one fixed "other"
+            other = pick_model(estimated_prompt_tokens + max_tokens, exclude=chosen_model)
+            if other:
                 payload["model"] = other
+                payload.pop("reasoning_effort", None)
                 if other.startswith(REASONING_MODELS_PREFIX):
                     payload["reasoning_effort"] = reasoning_effort
                 chosen_model = other

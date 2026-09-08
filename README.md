@@ -40,14 +40,18 @@ to an LLM-composed continuation of the conversation.
 
 ## Tradeoffs
 
-- **Free-tier Groq rate limit (8000 TPM per model) is the binding constraint, not model
-  quality.** I trimmed the prompt aggressively (compact JSON, only kind-relevant category
-  fields, 2-turn conversation history, offer titles instead of full offer objects) and added
-  a round-robin between two available models (`openai/gpt-oss-120b` / `-20b`) with a
-  client-side usage tracker that skips straight to the fallback template rather than firing a
-  call that would just 429. In a 60-minute judged window with many merchants ticking
-  concurrently, expect some fraction of sends to be fallback-quality under sustained load — a
-  paid/higher-tier key removes this ceiling entirely with no code change.
+- **Free-tier Groq keys cap each model at its own tokens-per-minute budget, not a shared
+  account-wide one.** I trimmed the prompt aggressively (compact JSON, only kind-relevant
+  category fields, 2-turn conversation history, offer titles instead of full offer objects)
+  and pool four models behind a single client-side usage tracker (`groq_client.py`):
+  `openai/gpt-oss-120b` (primary, 8000 TPM) → `qwen/qwen3.8-27b` (8000 TPM) →
+  `groq/compound-mini` (70000 TPM overflow) → `openai/gpt-oss-20b` (8000 TPM, last resort) →
+  deterministic template. Pool order is a quality/determinism preference, not round-robin —
+  the two smaller/agentic models are validated overflow capacity, not equal partners, since
+  they follow multi-step behavioral instructions (e.g. off-topic redirects) less reliably in
+  testing than the primary. Combined budget is ~94,000 TPM/min, which should comfortably
+  absorb a single 60-minute judged window's realistic send volume; a paid/higher-tier key
+  removes the ceiling entirely with no code change if it's still not enough.
 - **URLs are never included**, even though the main brief says they're allowed when they add
   value — the testing brief's own failure-mode table (F.4) scores any URL as a hard fail
   (-3), so I optimized for the stricter, more operational rule.
