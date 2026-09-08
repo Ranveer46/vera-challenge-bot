@@ -195,7 +195,10 @@ research citation, or offer that isn't literally in the JSON. If a payload field
 placeholder (e.g. contains "placeholder": true) treat it as having no real facts -- fall back to real \
 merchant/category facts instead (performance numbers, peer_stats, signals, real offers, real digest items).
 2. Match category voice exactly: tone/register from category.voice, use vocab_allowed terms where natural, \
-NEVER use any word in category.voice.vocab_taboo (in any form/casing).
+NEVER use any word in category.voice.vocab_taboo (in any form/casing). If category.voice.salutation_examples \
+is non-empty, open with that exact salutation pattern (e.g. "Dr. {first_name}" for a clinical-peer category) \
+instead of a casual "Hey" / "Hi there" -- a casual opener on a peer-clinical category (dentists, doctors) \
+reads as off-voice even when the rest of the message is fine.
 3. Match language: if merchant.identity.languages includes "hi" (or customer language_pref mentions "hi"), \
 write natural Hindi-English code-mix in ROMAN SCRIPT ONLY (transliterated Hindi using English letters, e.g. \
 "aapka appointment kal hai, kya yeh time thik rahega?") -- NEVER use Devanagari script (never write हिन्दी \
@@ -227,6 +230,11 @@ it. If the trigger payload itself has no real number (e.g. it's a placeholder or
 one from elsewhere in the JSON instead, in this order of preference: merchant.performance (views/calls/ctr \
 and delta_7d), merchant.customer_aggregate, merchant.signals, category.peer_stats, category.offer_catalog \
 pricing, or category.digest. There is always a real number available somewhere in the JSON -- find it.
+14. SOCIAL PROOF IS UNDERUSED -- ACTIVELY LOOK FOR IT: whenever category.peer_stats has a real comparative \
+number (e.g. "peers average X"), prefer working it in as a second anchor alongside the merchant's own number \
+(e.g. "your CTR is 2.1% vs the metro median of 3.0%") rather than stating the merchant's number in isolation. \
+This is a real compulsion lever (peer comparison), not filler -- use it whenever the data supports it, not \
+just when the framing hint explicitly says so.
 
 Respond with ONLY a single JSON object, no prose before or after, no markdown fences:
 {"body": "...", "cta": "open_ended|binary_yes_no|binary_confirm_cancel|multi_choice_slot|none", "rationale": "..."}
@@ -284,9 +292,11 @@ def build_prompt(category: dict, merchant: dict, trigger: dict, customer: dict |
         "slug": category.get("slug"),
         "voice": {
             "tone": voice.get("tone"),
+            "register": voice.get("register"),
             "code_mix": voice.get("code_mix"),
             "vocab_allowed": (voice.get("vocab_allowed") or [])[:6],
             "vocab_taboo": voice.get("vocab_taboo") or [],
+            "salutation_examples": voice.get("salutation_examples") or [],
         },
         "offer_catalog_titles": [o.get("title") for o in category.get("offer_catalog", [])[:6]],
         "peer_stats": category.get("peer_stats", {}),
