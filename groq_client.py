@@ -52,30 +52,30 @@ def api_key() -> str | None:
 
 REASONING_MODELS_PREFIX = ("openai/gpt-oss",)
 
-# Free-tier Groq keys have a per-model tokens-per-minute cap, and it is NOT the
-# same for every model (observed on this account: 8000 TPM for the two
-# openai/gpt-oss-* models and for qwen/qwen3.8-27b, but 70000 TPM for
-# groq/compound-mini). Each model's budget is independent, so pooling several
-# gives a much larger combined ceiling than any single model alone.
+# Free-tier Groq keys have a per-model tokens-per-minute cap (observed: 8000 TPM
+# for each model below). Pooling several INDEPENDENT models gives a larger
+# combined ceiling than any single model alone -- "independent" is the key
+# word, verified the hard way: groq/compound-mini advertises a 70000 TPM budget
+# of its own, but it's an agentic model that internally calls other sub-models
+# (its real 429 responses named `openai/gpt-oss-120b` and
+# `llama-3.3-70b-versatile` as the actually-exhausted resource) -- so its
+# capacity silently collapses to near-zero exactly when the primary model is
+# already under load, i.e. exactly when we'd need overflow most. Excluded.
 #
-# Pool order is a deliberate quality/determinism preference, not round-robin:
-# 1. openai/gpt-oss-120b -- primary. Best-understood, plain chat model (no
-#    autonomous tool use), extensively validated in this codebase.
-# 2. qwen/qwen3.8-27b -- confirmed equally reliable on our hardest instruction-
-#    following case (off-topic decline+redirect) and produces clean JSON with
-#    no reasoning leakage into content.
-# 3. groq/compound-mini -- large overflow capacity (70000 TPM). Also validated
-#    on both the real composer prompt and the off-topic case, but it's an
-#    agentic model that CAN invoke tools autonomously, which is a small
-#    determinism/latency risk we'd rather not take as the default path.
-# 4. openai/gpt-oss-20b -- last-resort overflow before the deterministic
-#    template; demonstrated weaker multi-step instruction-following earlier.
+# Pool order is a deliberate quality/determinism preference, not round-robin.
+# All four below are validated on both the real composer prompt and our
+# hardest instruction-following case (off-topic decline+redirect):
+# 1. openai/gpt-oss-120b -- primary, best-understood plain chat model.
+# 2. qwen/qwen3.8-27b -- equally reliable, clean JSON, no reasoning leakage.
+# 3. openai/gpt-oss-safeguard-20b -- moderation-tuned but produces correct,
+#    on-voice business messages in testing; independent standalone model.
+# 4. openai/gpt-oss-20b -- last resort before the deterministic template;
+#    demonstrated weaker multi-step instruction-following earlier.
 #
-# Explicitly excluded after testing: qwen/qwen3.6-27b (leaks <think>...</think>
-# into the content field, breaking JSON parsing), allam-2-7b (defaults to
-# Arabic responses even for English/Hindi-English prompts), and
-# openai/gpt-oss-safeguard-20b (a moderation-tuned variant, not validated for
-# this use case).
+# Explicitly excluded after testing: groq/compound-mini and groq/compound (not
+# independent capacity, see above), qwen/qwen3.6-27b (leaks <think>...</think>
+# into the content field, breaking JSON parsing), and allam-2-7b (defaults to
+# Arabic responses even for English/Hindi-English prompts).
 #
 # GROQ_MODEL_POOL (comma-separated) is the one config knob that controls both
 # the pool AND the primary/display model (DEFAULT_MODEL = pool[0]) -- there is
@@ -83,7 +83,7 @@ REASONING_MODELS_PREFIX = ("openai/gpt-oss",)
 DEFAULT_MODEL_POOL = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
-    "groq/compound-mini",
+    "openai/gpt-oss-safeguard-20b",
     "openai/gpt-oss-20b",
 ]
 _POOL_ENV = os.environ.get("GROQ_MODEL_POOL")
@@ -93,8 +93,8 @@ DEFAULT_MODEL = _MODEL_POOL[0]
 MODEL_TPM_LIMITS: dict[str, int] = {
     "openai/gpt-oss-120b": 8000,
     "openai/gpt-oss-20b": 8000,
+    "openai/gpt-oss-safeguard-20b": 8000,
     "qwen/qwen3.8-27b": 8000,
-    "groq/compound-mini": 70000,
 }
 DEFAULT_TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.9  # stay under this fraction of each model's own cap
@@ -209,30 +209,33 @@ async def complete(
             raise GroqError(err or "unknown error")
 
         tried: set[str] = set()
-        last_error: str | None = None
+        attempts: list[str] = []
 
         for candidate in _MODEL_POOL:
             if not _has_headroom(candidate, total_estimate):
+                attempts.append(f"{candidate}: skipped (estimated {_estimated_recent_usage(candidate)}/{_model_tpm_limit(candidate)} TPM)")
                 continue
             _record_usage(candidate, total_estimate)  # reserve BEFORE firing
             tried.add(candidate)
             content, err = await _post_once(client, headers, candidate, system, user, temperature, max_tokens, reasoning_effort)
             if content is not None:
                 return content
-            last_error = err
+            attempts.append(f"{candidate}: {err}")
 
-        # every pooled model looked exhausted by our own estimate (or failed) --
-        # one short real backoff, then retry the primary model directly
+        # Every pooled model was either estimated-exhausted or genuinely failed.
+        # One short real backoff, then retry whichever model has the MOST estimated
+        # headroom (not blindly the primary) -- Groq's server-side burst bucket often
+        # recovers within a couple seconds even when our rolling-window estimate hasn't.
         if _MODEL_POOL:
             await asyncio.sleep(1.5)
-            primary = _MODEL_POOL[0]
-            _record_usage(primary, total_estimate)
-            content, err = await _post_once(client, headers, primary, system, user, temperature, max_tokens, reasoning_effort)
+            best = min(_MODEL_POOL, key=lambda m: _estimated_recent_usage(m) / _model_tpm_limit(m))
+            _record_usage(best, total_estimate)
+            content, err = await _post_once(client, headers, best, system, user, temperature, max_tokens, reasoning_effort)
             if content is not None:
                 return content
-            last_error = err
+            attempts.append(f"{best} (post-backoff): {err}")
 
-        raise GroqError(last_error or "no pooled models configured")
+        raise GroqError(" | ".join(attempts) if attempts else "no pooled models configured")
     finally:
         if owns_client:
             await client.aclose()

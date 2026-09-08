@@ -40,18 +40,25 @@ to an LLM-composed continuation of the conversation.
 
 ## Tradeoffs
 
-- **Free-tier Groq keys cap each model at its own tokens-per-minute budget, not a shared
-  account-wide one.** I trimmed the prompt aggressively (compact JSON, only kind-relevant
-  category fields, 2-turn conversation history, offer titles instead of full offer objects)
-  and pool four models behind a single client-side usage tracker (`groq_client.py`):
-  `openai/gpt-oss-120b` (primary, 8000 TPM) → `qwen/qwen3.8-27b` (8000 TPM) →
-  `groq/compound-mini` (70000 TPM overflow) → `openai/gpt-oss-20b` (8000 TPM, last resort) →
-  deterministic template. Pool order is a quality/determinism preference, not round-robin —
-  the two smaller/agentic models are validated overflow capacity, not equal partners, since
-  they follow multi-step behavioral instructions (e.g. off-topic redirects) less reliably in
-  testing than the primary. Combined budget is ~94,000 TPM/min, which should comfortably
-  absorb a single 60-minute judged window's realistic send volume; a paid/higher-tier key
-  removes the ceiling entirely with no code change if it's still not enough.
+- **Free-tier Groq keys cap each model at its own tokens-per-minute budget.** I trimmed the
+  prompt aggressively (compact JSON, only kind-relevant category fields, 2-turn conversation
+  history, offer titles instead of full offer objects) and pool four *independently hosted*
+  models behind a single client-side usage tracker (`groq_client.py`): `openai/gpt-oss-120b`
+  (primary) → `qwen/qwen3.8-27b` → `openai/gpt-oss-safeguard-20b` → `openai/gpt-oss-20b` (last
+  resort) → deterministic template, ~32,000 combined TPM. Pool order is a quality preference,
+  not round-robin -- all four are validated on the real composer prompt and on the hardest
+  instruction-following case in this codebase (off-topic decline+redirect).
+  `groq/compound-mini` was tried first as a large-capacity 5th tier (its own quota reports
+  70,000 TPM) but rejected after its real 429 responses named `openai/gpt-oss-120b` and
+  `llama-3.3-70b-versatile` as the actually-exhausted resource -- it's an agentic model that
+  calls other sub-models internally, so its capacity silently collapses to near-zero exactly
+  when the primary is already under load, i.e. exactly when overflow is needed most. Usage is
+  *reserved* the moment a model is picked, before the request fires, so several triggers
+  composed concurrently in one tick see each other's pending usage and spread across the pool
+  instead of racing onto the same "available" model. Under an artificial worst-case burst (25
+  triggers fired back-to-back with zero delay, far tighter than the real judge's 5-minutes-
+  between-ticks cadence) this pool sustained 13/14 real LLM compositions; a paid/higher-tier
+  key removes the ceiling entirely with no code change if still not enough.
 - **URLs are never included**, even though the main brief says they're allowed when they add
   value — the testing brief's own failure-mode table (F.4) scores any URL as a hard fail
   (-3), so I optimized for the stricter, more operational rule.

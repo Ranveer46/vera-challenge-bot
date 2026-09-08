@@ -84,9 +84,9 @@ async def metadata():
             "kind-specific framing prompt, Groq LLM at temperature=0, post-LLM validation (URL strip, "
             "CTA-shape check, taboo-vocab strip, anti-repetition retry) with a deterministic template "
             "fallback if the LLM is unavailable or times out. Composition draws from a preference-ordered "
-            "pool of Groq models with independent per-minute token budgets (a large-capacity model included "
-            "as overflow), so sustained load degrades gracefully through several real-LLM tiers before "
-            "ever reaching the template fallback. Reply handling uses fast regex/streak heuristics for "
+            "pool of independently-hosted Groq models with reserved (not after-the-fact) per-minute token "
+            "budgets, so sustained or concurrent load degrades gracefully through several real-LLM tiers "
+            "before ever reaching the template fallback. Reply handling uses fast regex/streak heuristics for "
             "auto-reply detection, intent-transition routing, and hostile/off-topic exits before falling "
             "through to an LLM-composed continuation."
         ),
