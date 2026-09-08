@@ -98,9 +98,11 @@ FRAMING: dict[str, str] = {
         "factual, not alarmist. binary_yes_no CTA -- this is an action trigger."
     ),
     "dormant_with_vera": (
-        "Acknowledge the gap without guilt-tripping. Re-open with one fresh, low-friction, curiosity or "
-        "asking-the-merchant angle (not a repeat of an old pitch) -- check conversation_history so you don't "
-        "resend something already sent. open_ended."
+        "Acknowledge the gap without guilt-tripping, but the re-open hook MUST be a real number specific to "
+        "THIS merchant -- pull one from performance (views/calls/ctr and its delta_7d), customer_aggregate, "
+        "signals, or peer_stats comparison. A generic 'thought of something new for you' with no real number "
+        "attached is a failure here. Pair the number with one fresh, low-friction curiosity or "
+        "asking-the-merchant angle (not a repeat of an old pitch -- check conversation_history). open_ended."
     ),
     "curious_ask_due": (
         "Ask the merchant a genuine, specific, low-effort question about their business this week "
@@ -110,8 +112,13 @@ FRAMING: dict[str, str] = {
     ),
     "active_planning_intent": (
         "The merchant is already mid-planning (see conversation_history/payload) -- deliver a concrete, "
-        "ready-to-use artifact (draft pricing, a plan) grounded in real catalog/locality data, not another "
-        "question. Effort externalization is the dominant lever. binary_yes_no or open_ended."
+        "ready-to-use artifact with REAL numbers (a tiered price list, a specific quantity and per-unit "
+        "price, a specific date/time window), grounded in category.offer_catalog and merchant.identity "
+        "locality -- not another question, and not a vague 'here's a draft' with no numbers in it. If the "
+        "trigger payload only has a topic label (no real numbers), build the numbers from the category's "
+        "offer_catalog pricing pattern applied to a plausible scope for this merchant -- state it as a "
+        "starting proposal ('here's a starter version') so it reads as a real draft, not a fabricated fact. "
+        "Effort externalization is the dominant lever. binary_yes_no or open_ended."
     ),
     "ipl_match_today": (
         "Use the specific match/day facts from payload. If weekday vs weekend dynamics matter for this "
@@ -138,13 +145,15 @@ FRAMING: dict[str, str] = {
         "supports it). Mention any senior/loyalty discount if it exists in merchant offers. binary_confirm_cancel."
     ),
     "customer_lapsed_soft": (
-        "Acknowledge time since last visit (relationship.last_visit) without guilt. Offer one relevant, "
-        "concrete reason to return (a real active offer, a new relevant service). No-shame framing. "
-        "binary_yes_no with a low-commitment ask."
+        "Acknowledge time since last visit -- state it as a specific number (days/weeks/months from "
+        "relationship.last_visit, or visits_total) without guilt. Offer one relevant, concrete reason to "
+        "return: a real active offer WITH its price from merchant.offers, or a new relevant service named "
+        "specifically. No-shame framing. binary_yes_no with a low-commitment ask."
     ),
     "customer_lapsed_hard": (
-        "Same as lapsed_soft but with more warmth and a stronger no-commitment safety net (free trial slot, "
-        "no auto-charge language) since the gap is longer. binary_yes_no."
+        "Same as lapsed_soft -- specific gap length, a named real offer with its price -- but with more "
+        "warmth and a stronger no-commitment safety net (free trial slot, no auto-charge language) since "
+        "the gap is longer. binary_yes_no."
     ),
     "trial_followup": (
         "Reference what they tried and ask how it went / offer the natural next step in their journey. "
@@ -211,6 +220,13 @@ lever(s) you used -- it must accurately describe what the body actually does.
 12. Never expose raw internal field names/slugs verbatim (anything with underscores or quotes around a \
 code-like token, e.g. "high_risk_adult_cohort", "ctr_below_peer_median"). Paraphrase what the signal means \
 in plain, natural words instead.
+13. SPECIFICITY IS MANDATORY, NOT OPTIONAL: the body MUST contain at least one concrete, verifiable number \
+(a price, a percentage, a count, a date, or a named source) drawn from the JSON you were given -- never a \
+purely qualitative message like "I've got something new for you" or "here's a draft" with zero numbers in \
+it. If the trigger payload itself has no real number (e.g. it's a placeholder or just a topic label), pull \
+one from elsewhere in the JSON instead, in this order of preference: merchant.performance (views/calls/ctr \
+and delta_7d), merchant.customer_aggregate, merchant.signals, category.peer_stats, category.offer_catalog \
+pricing, or category.digest. There is always a real number available somewhere in the JSON -- find it.
 
 Respond with ONLY a single JSON object, no prose before or after, no markdown fences:
 {"body": "...", "cta": "open_ended|binary_yes_no|binary_confirm_cancel|multi_choice_slot|none", "rationale": "..."}
@@ -403,6 +419,12 @@ def has_devanagari(body: str) -> bool:
     return bool(DEVANAGARI_RE.search(body))
 
 
+def lacks_specificity(body: str) -> bool:
+    """True if body has no digit at all -- a near-certain sign the message is a
+    vague qualitative pitch with no verifiable anchor (rule 13 violation)."""
+    return not re.search(r"\d", body)
+
+
 def anti_repeat(body: str, prior_bodies: list[str]) -> bool:
     """True if body is a near-duplicate of something already sent."""
     norm = re.sub(r"\s+", " ", body).strip().lower()
@@ -559,6 +581,15 @@ async def compose_message(
         if has_devanagari(result["body"]):
             needs_retry = True
             nudge += "\n\nIMPORTANT: your previous draft used Devanagari script. Rewrite Hindi words in ROMAN SCRIPT (transliterated), never Devanagari characters."
+        if lacks_specificity(result["body"]):
+            needs_retry = True
+            nudge += (
+                "\n\nIMPORTANT: your previous draft had zero concrete numbers in it (rule 13 violation). "
+                "Rewrite it to anchor on at least one real number from the JSON -- a price, a percentage, a "
+                "count, or a date. Find one in merchant.performance, merchant.customer_aggregate, "
+                "merchant.signals, category.peer_stats, or category.offer_catalog if the trigger payload "
+                "itself doesn't have one."
+            )
 
         if needs_retry:
             raw2 = await groq_client.complete(
